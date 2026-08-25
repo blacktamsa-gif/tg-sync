@@ -2,7 +2,7 @@ import os
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeVideo,
@@ -16,13 +16,18 @@ from database import (
 
 
 # ============================================================
-# Configuration
+# Time configuration
 # ============================================================
 
 UTC = timezone.utc
 
-# KST 2026-08-25 18:00
-# = UTC 2026-08-25 09:00
+# 최초 처리 기준
+#
+# KST 2026-08-25 18:00:00
+# =
+# UTC 2026-08-25 09:00:00
+#
+# 이 시각보다 이전의 메시지는 절대로 처리하지 않는다.
 CUTOFF_TIME = datetime(
     2026,
     8,
@@ -33,16 +38,26 @@ CUTOFF_TIME = datetime(
     tzinfo=UTC,
 )
 
-# GitHub Actions는 매시간 실행되므로
-# 실행 지연 및 경계 누락을 방지하기 위해 70분을 조회한다.
+# GitHub Actions가 매시간 실행되므로
+# 실행 지연 및 시간 경계에서 메시지가 빠지는 것을 방지하기 위해
+# 직전 70분을 조회한다.
 LOOKBACK_MINUTES = 70
 
 
 # ============================================================
-# Secret helpers
+# Secret helper
 # ============================================================
 
 def required_secret(name: str) -> str:
+    """
+    GitHub Actions Secret을 가져온다.
+
+    Secret이 없거나 빈 값이면
+    정확한 Secret 이름을 표시하고 종료한다.
+
+    실제 Secret 값은 로그에 출력하지 않는다.
+    """
+
     value = os.environ.get(name, "").strip()
 
     if not value:
@@ -58,20 +73,31 @@ def required_secret(name: str) -> str:
 # ============================================================
 
 try:
-    API_ID = int(required_secret("API_ID"))
+    API_ID = int(
+        required_secret("API_ID")
+    )
+
 except ValueError:
     raise RuntimeError(
-        "GitHub Actions Secret 'API_ID' must contain numbers only."
+        "GitHub Actions Secret 'API_ID' "
+        "must contain numbers only."
     )
 
 
 API_HASH = required_secret("API_HASH")
 SESSION = required_secret("SESSION")
 
-TARGET_CHAT = int(required_secret("TARGET_CHAT"))
+TARGET_CHAT = int(
+    required_secret("TARGET_CHAT")
+)
 
-TOPIC_A = int(required_secret("TOPIC_A"))
-TOPIC_B = int(required_secret("TOPIC_B"))
+TOPIC_A = int(
+    required_secret("TOPIC_A")
+)
+
+TOPIC_B = int(
+    required_secret("TOPIC_B")
+)
 
 
 SOURCE_A = required_secret("SOURCE_A")
@@ -79,6 +105,10 @@ SOURCE_B = required_secret("SOURCE_B")
 SOURCE_C = required_secret("SOURCE_C")
 SOURCE_D = required_secret("SOURCE_D")
 
+
+# ============================================================
+# Source → destination topic mapping
+# ============================================================
 
 SOURCE_MAPPING = {
     SOURCE_A: TOPIC_A,
@@ -89,7 +119,7 @@ SOURCE_MAPPING = {
 
 
 # ============================================================
-# Telegram Client
+# Telegram client
 # ============================================================
 
 client = TelegramClient(
@@ -100,36 +130,278 @@ client = TelegramClient(
 
 
 # ============================================================
-# Utility functions
+# Entity cache
 # ============================================================
 
-def normalize_datetime(dt: datetime) -> datetime:
+# 한 번 조회한 Telegram Dialog/Entity를
+# 같은 실행 중에는 다시 조회하지 않는다.
+DIALOG_ENTITIES = None
+
+
+async def load_dialog_entities():
     """
-    Telegram datetime를 UTC aware datetime으로 변환.
+    현재 로그인한 계정의 Telegram 대화 목록을 한 번만 가져온다.
+
+    private chat / group / supergroup / channel 등을
+    모두 포함한다.
+
+    반환값:
+        {
+            peer_id: entity,
+            raw_id: entity,
+            username: entity
+        }
+    """
+
+    global DIALOG_ENTITIES
+
+    if DIALOG_ENTITIES is not None:
+        return DIALOG_ENTITIES
+
+    print()
+    print("[DIALOGS] Loading Telegram dialogs...")
+
+    dialogs = await client.get_dialogs()
+
+    by_peer_id = {}
+    by_raw_id = {}
+    by_username = {}
+
+    for dialog in dialogs:
+
+        entity = dialog.entity
+
+        # ----------------------------------------------------
+        # Peer ID
+        # ----------------------------------------------------
+
+        try:
+            peer_id = utils.get_peer_id(
+                entity
+            )
+
+            by_peer_id[
+                str(peer_id)
+            ] = entity
+
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # Raw ID
+        # ----------------------------------------------------
+
+        try:
+            raw_id = getattr(
+                entity,
+                "id",
+                None,
+            )
+
+            if raw_id is not None:
+                by_raw_id[
+                    str(raw_id)
+                ] = entity
+
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # Username
+        # ----------------------------------------------------
+
+        try:
+            username = getattr(
+                entity,
+                "username",
+                None,
+            )
+
+            if username:
+                by_username[
+                    username.lower()
+                ] = entity
+
+        except Exception:
+            pass
+
+    DIALOG_ENTITIES = {
+        "peer_id": by_peer_id,
+        "raw_id": by_raw_id,
+        "username": by_username,
+    }
+
+    print(
+        f"[DIALOGS] Loaded {len(dialogs)} dialogs."
+    )
+
+    print(
+        f"[DIALOGS] "
+        f"peer_ids={len(by_peer_id)} "
+        f"raw_ids={len(by_raw_id)} "
+        f"usernames={len(by_username)}"
+    )
+
+    return DIALOG_ENTITIES
+
+
+# ============================================================
+# Resolve Telegram source
+# ============================================================
+
+async def resolve_source_entity(source):
+    """
+    Source를 실제 Telethon Entity로 변환한다.
+
+    우선 현재 로그인한 계정의 Dialog 목록에서 찾는다.
+
+    지원:
+        - -100xxxxxxxxxx 형태의 Peer ID
+        - Raw ID
+        - @username
+        - username
+
+    Dialog 목록에서 찾지 못하면
+    마지막으로 client.get_entity()를 시도한다.
+    """
+
+    source = str(
+        source
+    ).strip()
+
+    print(
+        f"[RESOLVE] Trying source={source}"
+    )
+
+    entities = await load_dialog_entities()
+
+    # --------------------------------------------------------
+    # 1. Peer ID
+    # --------------------------------------------------------
+
+    entity = entities["peer_id"].get(
+        source
+    )
+
+    if entity is not None:
+
+        print(
+            f"[RESOLVE SUCCESS] "
+            f"Matched Peer ID {source}"
+        )
+
+        return entity
+
+    # --------------------------------------------------------
+    # 2. Raw ID
+    # --------------------------------------------------------
+
+    entity = entities["raw_id"].get(
+        source
+    )
+
+    if entity is not None:
+
+        print(
+            f"[RESOLVE SUCCESS] "
+            f"Matched Raw ID {source}"
+        )
+
+        return entity
+
+    # --------------------------------------------------------
+    # 3. Username
+    # --------------------------------------------------------
+
+    username = source.lstrip("@").lower()
+
+    entity = entities["username"].get(
+        username
+    )
+
+    if entity is not None:
+
+        print(
+            f"[RESOLVE SUCCESS] "
+            f"Matched username @{username}"
+        )
+
+        return entity
+
+    # --------------------------------------------------------
+    # 4. get_entity() fallback
+    # --------------------------------------------------------
+
+    try:
+
+        entity = await client.get_entity(
+            source
+        )
+
+        print(
+            f"[RESOLVE SUCCESS] "
+            f"client.get_entity({source})"
+        )
+
+        return entity
+
+    except Exception as exc:
+
+        print(
+            f"[RESOLVE FAILED] "
+            f"source={source} "
+            f"type={type(exc).__name__} "
+            f"message={exc}"
+        )
+
+        raise ValueError(
+            f"Cannot resolve Telegram source: {source}. "
+            f"The logged-in Telegram account may not have "
+            f"access to this group/channel, or the supplied "
+            f"ID/username is incorrect."
+        ) from exc
+
+
+# ============================================================
+# Time utilities
+# ============================================================
+
+def normalize_datetime(
+    dt: datetime,
+) -> datetime:
+    """
+    Telegram datetime을 UTC aware datetime으로 변환한다.
     """
 
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
 
-    return dt.astimezone(UTC)
+        return dt.replace(
+            tzinfo=UTC
+        )
+
+    return dt.astimezone(
+        UTC
+    )
 
 
 def calculate_since() -> datetime:
     """
-    이번 실행에서 조회를 시작할 시간.
+    이번 실행에서 검색할 시작 시각.
 
-    예:
-    현재 19:00 KST라면 약 17:50 KST부터 확인.
-
-    단, 최초 기준인
-    2026-08-25 18:00 KST
-    이전은 절대로 처리하지 않는다.
+    현재 시각에서 70분을 빼되,
+    최초 기준 시각인 2026-08-25 18:00 KST보다
+    이전으로 내려가지 않는다.
     """
 
-    now = datetime.now(UTC)
+    now = datetime.now(
+        UTC
+    )
 
-    lookback = now - timedelta(
-        minutes=LOOKBACK_MINUTES
+    lookback = (
+        now
+        - timedelta(
+            minutes=LOOKBACK_MINUTES
+        )
     )
 
     return max(
@@ -138,11 +410,26 @@ def calculate_since() -> datetime:
     )
 
 
-def is_video_message(message) -> bool:
-    """
-    메시지가 실제 동영상인지 확인.
+# ============================================================
+# Video detection
+# ============================================================
 
-    사진, 텍스트, 일반 문서 등은 제외한다.
+def is_video_message(
+    message,
+) -> bool:
+    """
+    메시지가 동영상인지 확인한다.
+
+    포함:
+        - Telegram video
+        - video document
+
+    제외:
+        - text
+        - photo
+        - 일반 document
+        - sticker
+        - 기타 media
     """
 
     if message is None:
@@ -163,59 +450,101 @@ def is_video_message(message) -> bool:
         return False
 
     for attribute in document.attributes:
+
         if isinstance(
             attribute,
             DocumentAttributeVideo,
         ):
+
             return True
 
     return False
 
 
-def get_group_key(message):
+# ============================================================
+# Album grouping
+# ============================================================
+
+def get_group_key(
+    message,
+):
     """
-    Telegram 앨범 여부를 판단한다.
+    Telegram 앨범 그룹을 판단한다.
 
-    grouped_id가 있으면 같은 앨범으로 처리한다.
+    grouped_id가 동일한 메시지는
+    하나의 앨범으로 묶는다.
 
-    사진 + 동영상이 섞인 앨범이어도
-    이후 is_video_message() 단계에서
-    동영상만 남긴다.
+    사진 + 동영상이 섞인 앨범도
+    같은 그룹으로 먼저 묶은 뒤,
+    upload 단계에서 동영상만 남긴다.
     """
 
     if message.grouped_id is not None:
+
         return (
             "album",
-            int(message.grouped_id),
+            int(
+                message.grouped_id
+            ),
         )
 
     return (
         "single",
-        int(message.id),
+        int(
+            message.id
+        ),
     )
 
 
-def group_messages(messages):
+def group_messages(
+    messages,
+):
     """
-    메시지를 앨범 단위로 묶는다.
+    메시지를 Telegram 앨범 단위로 그룹화한다.
+
+    예:
+
+        사진
+        동영상
+        동영상
+        사진
+
+    같은 grouped_id라면:
+
+        [사진, 동영상, 동영상, 사진]
+
+    하나의 그룹으로 만든다.
+
+    이후 업로드 단계에서:
+
+        [동영상, 동영상]
+
+    만 추출한다.
     """
 
     groups = {}
 
     for message in messages:
 
-        key = get_group_key(message)
+        key = get_group_key(
+            message
+        )
 
         groups.setdefault(
             key,
             [],
-        ).append(message)
+        ).append(
+            message
+        )
 
+    # 각 앨범 내부를 메시지 ID 순서로 정렬
     for key in groups:
+
         groups[key].sort(
             key=lambda message: message.id
         )
 
+    # 앨범/개별 메시지를 메시지 ID 순서로 정렬
     return sorted(
         groups.values(),
         key=lambda group: group[0].id,
@@ -223,7 +552,7 @@ def group_messages(messages):
 
 
 # ============================================================
-# Message collection
+# Collect recent messages
 # ============================================================
 
 async def collect_recent_messages(
@@ -231,27 +560,52 @@ async def collect_recent_messages(
     since: datetime,
 ):
     """
-    Source에서 since 이후의 메시지를 가져온다.
+    Source 전체에서 since 이후의 메시지를 검색한다.
 
-    Telegram Forum Topic에 관계없이
-    source 전체 메시지를 검색한다.
+    중요:
+        Telegram Forum Topic 여부와 관계없이
+        해당 그룹/채널의 전체 메시지를 검색한다.
+
+    Forum Topic의 특정 topic ID를 필터로 사용하지 않는다.
     """
 
-    entity = await client.get_entity(source)
+    entity = await resolve_source_entity(
+        source
+    )
+
+    entity_name = getattr(
+        entity,
+        "title",
+        None,
+    )
+
+    entity_id = getattr(
+        entity,
+        "id",
+        None,
+    )
 
     print(
         f"[SOURCE ENTITY] "
-        f"name={getattr(entity, 'title', None)!r} "
-        f"id={getattr(entity, 'id', None)}"
+        f"name={entity_name!r} "
+        f"id={entity_id}"
     )
 
     collected = []
 
-    now = datetime.now(UTC)
+    now = datetime.now(
+        UTC
+    )
+
+    # --------------------------------------------------------
+    # 최신 메시지 → 오래된 메시지 순서
+    #
+    # reverse=True를 사용하지 않는다.
+    # 기본 iter_messages()는 최신 메시지부터 내려간다.
+    # --------------------------------------------------------
 
     async for message in client.iter_messages(
         entity,
-        reverse=True,
     ):
 
         if not message.date:
@@ -261,25 +615,42 @@ async def collect_recent_messages(
             message.date
         )
 
-        # 최초 기준보다 이전이면 절대 처리하지 않는다.
-        if message_time < CUTOFF_TIME:
-            continue
+        # ----------------------------------------------------
+        # 너무 오래된 메시지
+        #
+        # 최신 → 과거 순으로 읽기 때문에
+        # since보다 오래된 순간 종료한다.
+        # ----------------------------------------------------
 
-        # 이번 실행의 조회 범위 이전이면 종료.
         if message_time < since:
+
             break
 
-        # 미래 메시지는 무시.
-        if message_time > now:
+        # ----------------------------------------------------
+        # 최초 cutoff 이전은 절대 처리하지 않는다.
+        # ----------------------------------------------------
+
+        if message_time < CUTOFF_TIME:
+
             continue
 
-        collected.append(message)
+        # ----------------------------------------------------
+        # 미래 메시지 무시
+        # ----------------------------------------------------
+
+        if message_time > now:
+
+            continue
+
+        collected.append(
+            message
+        )
 
     return collected
 
 
 # ============================================================
-# Upload
+# Upload video group
 # ============================================================
 
 async def send_video_group(
@@ -288,12 +659,22 @@ async def send_video_group(
     topic_id,
 ):
     """
-    하나의 메시지 또는 앨범에서
-    동영상만 추출하여 Target Topic으로 전송.
+    하나의 개별 메시지 또는 앨범에서
+    동영상만 추출하여 대상 Forum Topic으로 업로드한다.
+
+    규칙:
+
+        text       → 제외
+        photo      → 제외
+        video      → 업로드
+        album      → video만 업로드
+
+    앨범에 동영상이 여러 개 있으면
+    하나의 Telegram album으로 보낸다.
     """
 
     # --------------------------------------------------------
-    # 동영상만 남긴다.
+    # 1. 동영상만 추출
     # --------------------------------------------------------
 
     video_messages = [
@@ -309,6 +690,7 @@ async def send_video_group(
     )
 
     if not video_messages:
+
         print(
             "[SKIP] "
             "No video in this message/group."
@@ -317,20 +699,26 @@ async def send_video_group(
         return
 
     # --------------------------------------------------------
-    # 이미 처리한 동영상 제거
+    # 2. 이미 처리된 동영상 제거
     # --------------------------------------------------------
 
     new_video_messages = []
 
     for message in video_messages:
 
-        source_id = int(message.chat_id)
-        message_id = int(message.id)
+        source_id = int(
+            message.chat_id
+        )
+
+        message_id = int(
+            message.id
+        )
 
         if is_processed(
             source_id,
             message_id,
         ):
+
             print(
                 f"[DUPLICATE] "
                 f"source={source_id} "
@@ -353,11 +741,13 @@ async def send_video_group(
         return
 
     # --------------------------------------------------------
-    # 로그
+    # 3. 업로드 로그
     # --------------------------------------------------------
 
     message_ids = [
-        int(message.id)
+        int(
+            message.id
+        )
         for message in new_video_messages
     ]
 
@@ -369,7 +759,12 @@ async def send_video_group(
     )
 
     # --------------------------------------------------------
-    # 실제 Telegram 업로드
+    # 4. Media 추출
+    #
+    # caption을 전달하지 않기 때문에
+    # 원본 동영상의 설명/텍스트는 복사하지 않는다.
+    #
+    # 사진은 이미 위에서 제거되었다.
     # --------------------------------------------------------
 
     media = [
@@ -379,14 +774,31 @@ async def send_video_group(
 
     try:
 
-        await client.send_file(
-            entity=target_chat,
-            file=media,
-            caption=None,
+        # ----------------------------------------------------
+        # 여러 동영상:
+        # Telegram album으로 전송
+        #
+        # 하나의 동영상:
+        # 단일 파일 전송
+        # ----------------------------------------------------
 
-            # Forum Topic의 root message ID
-            reply_to=topic_id,
-        )
+        if len(media) == 1:
+
+            await client.send_file(
+                entity=target_chat,
+                file=media[0],
+                caption=None,
+                reply_to=topic_id,
+            )
+
+        else:
+
+            await client.send_file(
+                entity=target_chat,
+                file=media,
+                caption=None,
+                reply_to=topic_id,
+            )
 
     except Exception as exc:
 
@@ -396,12 +808,13 @@ async def send_video_group(
             f"message={exc}"
         )
 
-        # 업로드 실패 시 processed 기록을 하지 않는다.
-        # 다음 실행에서 다시 시도할 수 있게 한다.
+        # 업로드 실패 시 database에 기록하지 않는다.
+        # 다음 실행에서 다시 시도할 수 있다.
+
         raise
 
     # --------------------------------------------------------
-    # 업로드 성공
+    # 5. 업로드 성공
     # --------------------------------------------------------
 
     print(
@@ -410,6 +823,12 @@ async def send_video_group(
         f"videos={len(new_video_messages)}"
     )
 
+    # --------------------------------------------------------
+    # 6. DB에 처리 완료 기록
+    #
+    # 반드시 업로드 성공 후에 기록한다.
+    # --------------------------------------------------------
+
     processed_at = datetime.now(
         UTC
     ).isoformat()
@@ -417,8 +836,12 @@ async def send_video_group(
     mark_processed(
         [
             (
-                int(message.chat_id),
-                int(message.id),
+                int(
+                    message.chat_id
+                ),
+                int(
+                    message.id
+                ),
             )
             for message in new_video_messages
         ],
@@ -432,7 +855,7 @@ async def send_video_group(
 
 
 # ============================================================
-# Source processing
+# Process one source
 # ============================================================
 
 async def process_source(
@@ -442,24 +865,36 @@ async def process_source(
     since,
 ):
     """
-    하나의 Source 처리.
+    하나의 Source를 처리한다.
     """
 
     print()
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
     print(
         f"[PROCESS SOURCE] "
         f"{source}"
     )
+
     print(
         f"[DESTINATION TOPIC] "
         f"{topic_id}"
     )
+
     print(
         f"[SINCE] "
         f"{since.isoformat()}"
     )
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
+
+    # --------------------------------------------------------
+    # 메시지 검색
+    # --------------------------------------------------------
 
     try:
 
@@ -493,6 +928,10 @@ async def process_source(
 
         return
 
+    # --------------------------------------------------------
+    # 앨범 그룹화
+    # --------------------------------------------------------
+
     groups = group_messages(
         messages
     )
@@ -501,6 +940,10 @@ async def process_source(
         f"[GROUPS FOUND] "
         f"{len(groups)}"
     )
+
+    # --------------------------------------------------------
+    # 그룹별 처리
+    # --------------------------------------------------------
 
     for index, group in enumerate(
         groups,
@@ -528,7 +971,12 @@ async def process_source(
                 f"message={exc}"
             )
 
-            raise
+            # 한 앨범 실패 시 해당 Source의 다음 그룹도
+            # 계속 처리한다.
+            #
+            # 단, 실패한 메시지는 DB에 기록되지 않았으므로
+            # 다음 실행에서 재시도된다.
+            continue
 
 
 # ============================================================
@@ -537,14 +985,28 @@ async def process_source(
 
 async def main():
 
+    # --------------------------------------------------------
+    # 실행 시간 계산
+    # --------------------------------------------------------
+
+    now = datetime.now(
+        UTC
+    )
+
     since = calculate_since()
 
-    now = datetime.now(UTC)
-
     print()
-    print("=" * 70)
-    print("Telegram Scheduled Video Processor")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        "Telegram Scheduled Video Processor"
+    )
+
+    print(
+        "=" * 70
+    )
 
     print(
         f"[NOW UTC] "
@@ -557,8 +1019,8 @@ async def main():
     )
 
     print(
-        f"[CUTOFF KST] "
-        f"2026-08-25 18:00:00+09:00"
+        "[CUTOFF KST] "
+        "2026-08-25 18:00:00+09:00"
     )
 
     print(
@@ -586,7 +1048,9 @@ async def main():
         f"{TOPIC_B}"
     )
 
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
 
     # --------------------------------------------------------
     # Telegram 로그인
@@ -601,6 +1065,7 @@ async def main():
     me = await client.get_me()
 
     if me is None:
+
         raise RuntimeError(
             "Telegram authentication failed."
         )
@@ -650,8 +1115,8 @@ async def main():
                 f"message={exc}"
             )
 
-            # 한 Source가 실패해도
-            # 다른 Source는 계속 처리한다.
+            # Source 하나가 실패해도
+            # 나머지 Source는 계속 처리한다.
             continue
 
     # --------------------------------------------------------
@@ -659,9 +1124,17 @@ async def main():
     # --------------------------------------------------------
 
     print()
-    print("=" * 70)
-    print("JOB FINISHED")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        "JOB FINISHED"
+    )
+
+    print(
+        "=" * 70
+    )
 
 
 # ============================================================
@@ -679,9 +1152,17 @@ if __name__ == "__main__":
     except Exception as exc:
 
         print()
-        print("=" * 70)
-        print("FATAL ERROR")
-        print("=" * 70)
+        print(
+            "=" * 70
+        )
+
+        print(
+            "FATAL ERROR"
+        )
+
+        print(
+            "=" * 70
+        )
 
         print(
             f"type={type(exc).__name__}"
