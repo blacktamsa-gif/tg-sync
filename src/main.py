@@ -7,6 +7,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeVideo,
     MessageMediaDocument,
+    InputReplyToMessage,
 )
 
 from database import (
@@ -27,7 +28,7 @@ UTC = timezone.utc
 # =
 # UTC 2026-08-25 09:00:00
 #
-# 이 시각보다 이전의 메시지는 절대로 처리하지 않는다.
+# 이 시각보다 이전의 메시지는 처리하지 않는다.
 CUTOFF_TIME = datetime(
     2026,
     8,
@@ -39,22 +40,19 @@ CUTOFF_TIME = datetime(
 )
 
 # GitHub Actions가 매시간 실행되므로
-# 실행 지연 및 시간 경계에서 메시지가 빠지는 것을 방지하기 위해
-# 직전 70분을 조회한다.
+# 실행 지연 및 시간 경계에서 메시지가 빠지는 것을 방지한다.
 LOOKBACK_MINUTES = 70
 
 
 # ============================================================
-# Secret helper
+# GitHub Secrets helper
 # ============================================================
 
 def required_secret(name: str) -> str:
     """
     GitHub Actions Secret을 가져온다.
 
-    Secret이 없거나 빈 값이면
-    정확한 Secret 이름을 표시하고 종료한다.
-
+    Secret이 없거나 빈 값이면 오류를 발생시킨다.
     실제 Secret 값은 로그에 출력하지 않는다.
     """
 
@@ -79,8 +77,7 @@ try:
 
 except ValueError:
     raise RuntimeError(
-        "GitHub Actions Secret 'API_ID' "
-        "must contain numbers only."
+        "GitHub Actions Secret 'API_ID' must contain numbers only."
     )
 
 
@@ -98,7 +95,6 @@ TOPIC_A = int(
 TOPIC_B = int(
     required_secret("TOPIC_B")
 )
-
 
 SOURCE_A = required_secret("SOURCE_A")
 SOURCE_B = required_secret("SOURCE_B")
@@ -133,8 +129,6 @@ client = TelegramClient(
 # Entity cache
 # ============================================================
 
-# 한 번 조회한 Telegram Dialog/Entity를
-# 같은 실행 중에는 다시 조회하지 않는다.
 DIALOG_ENTITIES = None
 
 
@@ -142,15 +136,8 @@ async def load_dialog_entities():
     """
     현재 로그인한 계정의 Telegram 대화 목록을 한 번만 가져온다.
 
-    private chat / group / supergroup / channel 등을
-    모두 포함한다.
-
-    반환값:
-        {
-            peer_id: entity,
-            raw_id: entity,
-            username: entity
-        }
+    Peer ID / Raw ID / Username으로 빠르게 Entity를 찾을 수 있도록
+    실행 중 메모리에 캐시한다.
     """
 
     global DIALOG_ENTITIES
@@ -199,6 +186,7 @@ async def load_dialog_entities():
             )
 
             if raw_id is not None:
+
                 by_raw_id[
                     str(raw_id)
                 ] = entity
@@ -218,6 +206,7 @@ async def load_dialog_entities():
             )
 
             if username:
+
                 by_username[
                     username.lower()
                 ] = entity
@@ -261,8 +250,7 @@ async def resolve_source_entity(source):
         - @username
         - username
 
-    Dialog 목록에서 찾지 못하면
-    마지막으로 client.get_entity()를 시도한다.
+    Dialog에서 찾지 못하면 get_entity()를 마지막으로 시도한다.
     """
 
     source = str(
@@ -389,8 +377,7 @@ def calculate_since() -> datetime:
     이번 실행에서 검색할 시작 시각.
 
     현재 시각에서 70분을 빼되,
-    최초 기준 시각인 2026-08-25 18:00 KST보다
-    이전으로 내려가지 않는다.
+    최초 기준 시각보다 이전으로 내려가지 않는다.
     """
 
     now = datetime.now(
@@ -471,12 +458,7 @@ def get_group_key(
     """
     Telegram 앨범 그룹을 판단한다.
 
-    grouped_id가 동일한 메시지는
-    하나의 앨범으로 묶는다.
-
-    사진 + 동영상이 섞인 앨범도
-    같은 그룹으로 먼저 묶은 뒤,
-    upload 단계에서 동영상만 남긴다.
+    grouped_id가 동일하면 하나의 앨범으로 취급한다.
     """
 
     if message.grouped_id is not None:
@@ -502,24 +484,10 @@ def group_messages(
     """
     메시지를 Telegram 앨범 단위로 그룹화한다.
 
-    예:
+    사진 + 동영상이 섞여 있어도
+    같은 grouped_id라면 하나의 그룹으로 묶는다.
 
-        사진
-        동영상
-        동영상
-        사진
-
-    같은 grouped_id라면:
-
-        [사진, 동영상, 동영상, 사진]
-
-    하나의 그룹으로 만든다.
-
-    이후 업로드 단계에서:
-
-        [동영상, 동영상]
-
-    만 추출한다.
+    이후 업로드 단계에서 동영상만 남긴다.
     """
 
     groups = {}
@@ -537,14 +505,14 @@ def group_messages(
             message
         )
 
-    # 각 앨범 내부를 메시지 ID 순서로 정렬
+    # 앨범 내부 메시지 순서
     for key in groups:
 
         groups[key].sort(
             key=lambda message: message.id
         )
 
-    # 앨범/개별 메시지를 메시지 ID 순서로 정렬
+    # 전체 그룹 순서
     return sorted(
         groups.values(),
         key=lambda group: group[0].id,
@@ -562,11 +530,7 @@ async def collect_recent_messages(
     """
     Source 전체에서 since 이후의 메시지를 검색한다.
 
-    중요:
-        Telegram Forum Topic 여부와 관계없이
-        해당 그룹/채널의 전체 메시지를 검색한다.
-
-    Forum Topic의 특정 topic ID를 필터로 사용하지 않는다.
+    Forum Topic 여부와 관계없이 전체 메시지를 확인한다.
     """
 
     entity = await resolve_source_entity(
@@ -597,13 +561,7 @@ async def collect_recent_messages(
         UTC
     )
 
-    # --------------------------------------------------------
-    # 최신 메시지 → 오래된 메시지 순서
-    #
-    # reverse=True를 사용하지 않는다.
-    # 기본 iter_messages()는 최신 메시지부터 내려간다.
-    # --------------------------------------------------------
-
+    # 최신 메시지 → 과거 메시지
     async for message in client.iter_messages(
         entity,
     ):
@@ -615,38 +573,60 @@ async def collect_recent_messages(
             message.date
         )
 
-        # ----------------------------------------------------
-        # 너무 오래된 메시지
-        #
-        # 최신 → 과거 순으로 읽기 때문에
-        # since보다 오래된 순간 종료한다.
-        # ----------------------------------------------------
-
-        if message_time < since:
-
-            break
-
-        # ----------------------------------------------------
-        # 최초 cutoff 이전은 절대 처리하지 않는다.
-        # ----------------------------------------------------
-
-        if message_time < CUTOFF_TIME:
-
-            continue
-
-        # ----------------------------------------------------
-        # 미래 메시지 무시
-        # ----------------------------------------------------
-
+        # 현재 시각보다 미래인 메시지는 무시
         if message_time > now:
-
             continue
+
+        # 최초 기준 이전 메시지는 무시
+        if message_time < CUTOFF_TIME:
+            continue
+
+        # 이번 실행의 조회 시작점 이전이면 종료
+        if message_time < since:
+            break
 
         collected.append(
             message
         )
 
     return collected
+
+
+# ============================================================
+# Forum topic reply object
+# ============================================================
+
+def create_topic_reply(
+    topic_id: int,
+):
+    """
+    Telegram Forum Topic에 메시지를 넣기 위한 Reply 객체.
+
+    가장 중요한 부분:
+
+        quote=False
+
+    이렇게 하면 토픽의 첫 메시지를
+    '인용 메시지' 형태로 표시하지 않는다.
+
+    따라서 결과적으로:
+        MOOK
+        동영상
+
+    형태의 초록색 인용/미리보기가 붙는 것을 방지한다.
+
+    topic_id는 Forum Topic의 top/root message ID이다.
+    """
+
+    return InputReplyToMessage(
+        reply_to_msg_id=int(
+            topic_id
+        ),
+        top_msg_id=int(
+            topic_id
+        ),
+        quote=False,
+    )
 
 
 # ============================================================
@@ -667,10 +647,22 @@ async def send_video_group(
         text       → 제외
         photo      → 제외
         video      → 업로드
-        album      → video만 업로드
 
-    앨범에 동영상이 여러 개 있으면
-    하나의 Telegram album으로 보낸다.
+    앨범:
+
+        photo
+        video
+        photo
+        video
+
+    라면:
+
+        video
+        video
+
+    만 업로드한다.
+
+    원본 caption/설명은 전달하지 않는다.
     """
 
     # --------------------------------------------------------
@@ -741,8 +733,13 @@ async def send_video_group(
         return
 
     # --------------------------------------------------------
-    # 3. 업로드 로그
+    # 3. 업로드할 Telegram media
     # --------------------------------------------------------
+
+    media = [
+        message.media
+        for message in new_video_messages
+    ]
 
     message_ids = [
         int(
@@ -759,27 +756,26 @@ async def send_video_group(
     )
 
     # --------------------------------------------------------
-    # 4. Media 추출
+    # 4. Forum Topic reply object
     #
-    # caption을 전달하지 않기 때문에
-    # 원본 동영상의 설명/텍스트는 복사하지 않는다.
+    # quote=False
     #
-    # 사진은 이미 위에서 제거되었다.
+    # 이것이 기존에 보이던
+    #
+    # MOOK
+    # 동영상
+    #
+    # 형태의 인용 표시를 제거한다.
     # --------------------------------------------------------
 
-    media = [
-        message.media
-        for message in new_video_messages
-    ]
+    topic_reply = create_topic_reply(
+        topic_id
+    )
 
     try:
 
         # ----------------------------------------------------
-        # 여러 동영상:
-        # Telegram album으로 전송
-        #
-        # 하나의 동영상:
-        # 단일 파일 전송
+        # 단일 동영상
         # ----------------------------------------------------
 
         if len(media) == 1:
@@ -787,17 +783,31 @@ async def send_video_group(
             await client.send_file(
                 entity=target_chat,
                 file=media[0],
+
+                # 원본 caption을 전달하지 않는다.
                 caption=None,
-                reply_to=topic_id,
+
+                # Forum Topic 지정
+                reply_to=topic_reply,
             )
+
+        # ----------------------------------------------------
+        # 여러 동영상
+        #
+        # 하나의 Telegram album으로 전송
+        # ----------------------------------------------------
 
         else:
 
             await client.send_file(
                 entity=target_chat,
                 file=media,
+
+                # 원본 caption을 전달하지 않는다.
                 caption=None,
-                reply_to=topic_id,
+
+                # Forum Topic 지정
+                reply_to=topic_reply,
             )
 
     except Exception as exc:
@@ -808,8 +818,8 @@ async def send_video_group(
             f"message={exc}"
         )
 
-        # 업로드 실패 시 database에 기록하지 않는다.
-        # 다음 실행에서 다시 시도할 수 있다.
+        # 업로드 실패 시 DB에 기록하지 않는다.
+        # 다음 실행에서 재시도할 수 있다.
 
         raise
 
@@ -824,9 +834,9 @@ async def send_video_group(
     )
 
     # --------------------------------------------------------
-    # 6. DB에 처리 완료 기록
+    # 6. DB 기록
     #
-    # 반드시 업로드 성공 후에 기록한다.
+    # 반드시 업로드 성공 후 기록한다.
     # --------------------------------------------------------
 
     processed_at = datetime.now(
@@ -971,11 +981,8 @@ async def process_source(
                 f"message={exc}"
             )
 
-            # 한 앨범 실패 시 해당 Source의 다음 그룹도
-            # 계속 처리한다.
-            #
-            # 단, 실패한 메시지는 DB에 기록되지 않았으므로
-            # 다음 실행에서 재시도된다.
+            # 한 그룹이 실패해도
+            # 나머지 그룹은 계속 처리한다.
             continue
 
 
@@ -986,7 +993,7 @@ async def process_source(
 async def main():
 
     # --------------------------------------------------------
-    # 실행 시간 계산
+    # 실행 시간
     # --------------------------------------------------------
 
     now = datetime.now(
@@ -1115,7 +1122,7 @@ async def main():
                 f"message={exc}"
             )
 
-            # Source 하나가 실패해도
+            # 하나의 Source가 실패해도
             # 나머지 Source는 계속 처리한다.
             continue
 
