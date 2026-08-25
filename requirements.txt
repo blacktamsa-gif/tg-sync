@@ -1,2 +1,2 @@
-Telethon==1.44.2
+Telethon==1.44.0
 cryptg==0.5.2
