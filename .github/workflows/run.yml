@@ -1,26 +1,11 @@
 name: Telegram Scheduled Video Processor
 
 on:
-  # ==========================================================
-  # 매시간 10분에 실행
-  #
-  # GitHub Actions cron은 UTC 기준
-  #
-  # "10 * * * *"
-  # = 매시간 10분
-  #
-  # KST에서도 매시간 10분에 해당한다.
-  # ==========================================================
   schedule:
     - cron: "10 * * * *"
 
-  # GitHub Actions 화면에서 수동 실행 가능
   workflow_dispatch:
 
-
-# ==========================================================
-# 중복 실행 방지
-# ==========================================================
 
 concurrency:
   group: telegram-video-processor
@@ -54,32 +39,23 @@ jobs:
 
 
       # ======================================================
-      # Restore SQLite processing database
-      #
-      # 중요:
-      #
-      # main.py 실행 시:
-      #
-      #     cd src
-      #     python main.py
-      #
-      # 이므로 database.py가 state.db를 만들면
-      # 실제 위치는:
-      #
-      #     src/state.db
-      #
-      # 따라서 cache path도 src/state.db여야 한다.
+      # Prepare directories
+      # ======================================================
+
+      - name: Prepare directories
+        run: |
+          mkdir -p src
+
+
+      # ======================================================
+      # Restore processing database
       # ======================================================
 
       - name: Restore processing database
         uses: actions/cache/restore@v5
         with:
           path: src/state.db
-
-          # 현재 실행은 고유한 cache key를 사용
-          # 이전 실행의 cache는 restore-keys로 검색
           key: telegram-state-${{ github.ref_name }}-${{ github.run_id }}
-
           restore-keys: |
             telegram-state-${{ github.ref_name }}-
 
@@ -129,21 +105,47 @@ jobs:
 
           echo "=========================================="
 
+          python -m py_compile src/main.py
+          python -m py_compile src/database.py
+
           cd src
 
           python main.py
 
 
       # ======================================================
-      # Save SQLite processing database
-      #
-      # 중요:
-      #
-      # 실제 DB 위치가 src/state.db이므로
-      # 반드시 같은 경로를 사용한다.
+      # Verify database
+      # ======================================================
+
+      - name: Verify processing database
+        if: always()
+        run: |
+
+          echo "=========================================="
+          echo "Database verification"
+          echo "=========================================="
+
+          if [ -f src/state.db ]; then
+
+            echo "state.db exists."
+
+            ls -lh src/state.db
+
+          else
+
+            echo "state.db does not exist."
+
+            echo "This is acceptable if no video was successfully uploaded."
+
+          fi
+
+
+      # ======================================================
+      # Save SQLite state
       # ======================================================
 
       - name: Save processing database
+        if: always()
         uses: actions/cache/save@v5
         with:
           path: src/state.db
