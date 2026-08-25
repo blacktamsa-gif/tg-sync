@@ -1,5 +1,6 @@
 import os
 import asyncio
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, utils
@@ -11,24 +12,21 @@ from telethon.tl.types import (
 )
 
 from database import (
+    init_db,
     is_processed,
     mark_processed,
+    count_processed,
 )
 
 
 # ============================================================
-# Time configuration
+# Time
 # ============================================================
 
 UTC = timezone.utc
 
-# 최초 처리 기준
-#
 # KST 2026-08-25 18:00:00
-# =
 # UTC 2026-08-25 09:00:00
-#
-# 이 시각보다 이전의 메시지는 처리하지 않는다.
 CUTOFF_TIME = datetime(
     2026,
     8,
@@ -39,50 +37,50 @@ CUTOFF_TIME = datetime(
     tzinfo=UTC,
 )
 
-# GitHub Actions가 매시간 실행되므로
-# 실행 지연 및 시간 경계에서 메시지가 빠지는 것을 방지한다.
 LOOKBACK_MINUTES = 70
 
 
 # ============================================================
-# GitHub Secrets helper
+# Secrets
 # ============================================================
 
 def required_secret(name: str) -> str:
-    """
-    GitHub Actions Secret을 가져온다.
 
-    Secret이 없거나 빈 값이면 오류를 발생시킨다.
-    실제 Secret 값은 로그에 출력하지 않는다.
-    """
-
-    value = os.environ.get(name, "").strip()
+    value = os.environ.get(
+        name,
+        "",
+    ).strip()
 
     if not value:
+
         raise RuntimeError(
-            f"GitHub Actions Secret '{name}' is missing or empty."
+            f"Required environment variable "
+            f"'{name}' is missing or empty."
         )
 
     return value
 
 
-# ============================================================
-# Telegram configuration
-# ============================================================
-
 try:
+
     API_ID = int(
         required_secret("API_ID")
     )
 
 except ValueError:
+
     raise RuntimeError(
-        "GitHub Actions Secret 'API_ID' must contain numbers only."
+        "API_ID must contain numbers only."
     )
 
 
-API_HASH = required_secret("API_HASH")
-SESSION = required_secret("SESSION")
+API_HASH = required_secret(
+    "API_HASH"
+)
+
+SESSION = required_secret(
+    "SESSION"
+)
 
 TARGET_CHAT = int(
     required_secret("TARGET_CHAT")
@@ -96,14 +94,25 @@ TOPIC_B = int(
     required_secret("TOPIC_B")
 )
 
-SOURCE_A = required_secret("SOURCE_A")
-SOURCE_B = required_secret("SOURCE_B")
-SOURCE_C = required_secret("SOURCE_C")
-SOURCE_D = required_secret("SOURCE_D")
+SOURCE_A = required_secret(
+    "SOURCE_A"
+)
+
+SOURCE_B = required_secret(
+    "SOURCE_B"
+)
+
+SOURCE_C = required_secret(
+    "SOURCE_C"
+)
+
+SOURCE_D = required_secret(
+    "SOURCE_D"
+)
 
 
 # ============================================================
-# Source → destination topic mapping
+# Source mapping
 # ============================================================
 
 SOURCE_MAPPING = {
@@ -115,7 +124,7 @@ SOURCE_MAPPING = {
 
 
 # ============================================================
-# Telegram client
+# Telegram
 # ============================================================
 
 client = TelegramClient(
@@ -126,27 +135,23 @@ client = TelegramClient(
 
 
 # ============================================================
-# Entity cache
+# Dialog cache
 # ============================================================
 
-DIALOG_ENTITIES = None
+DIALOG_CACHE = None
 
 
-async def load_dialog_entities():
-    """
-    현재 로그인한 계정의 Telegram 대화 목록을 한 번만 가져온다.
+async def load_dialog_cache():
 
-    Peer ID / Raw ID / Username으로 빠르게 Entity를 찾을 수 있도록
-    실행 중 메모리에 캐시한다.
-    """
+    global DIALOG_CACHE
 
-    global DIALOG_ENTITIES
+    if DIALOG_CACHE is not None:
 
-    if DIALOG_ENTITIES is not None:
-        return DIALOG_ENTITIES
+        return DIALOG_CACHE
 
-    print()
-    print("[DIALOGS] Loading Telegram dialogs...")
+    print(
+        "[DIALOGS] Loading Telegram dialogs..."
+    )
 
     dialogs = await client.get_dialogs()
 
@@ -163,6 +168,7 @@ async def load_dialog_entities():
         # ----------------------------------------------------
 
         try:
+
             peer_id = utils.get_peer_id(
                 entity
             )
@@ -179,6 +185,7 @@ async def load_dialog_entities():
         # ----------------------------------------------------
 
         try:
+
             raw_id = getattr(
                 entity,
                 "id",
@@ -199,6 +206,7 @@ async def load_dialog_entities():
         # ----------------------------------------------------
 
         try:
+
             username = getattr(
                 entity,
                 "username",
@@ -214,7 +222,7 @@ async def load_dialog_entities():
         except Exception:
             pass
 
-    DIALOG_ENTITIES = {
+    DIALOG_CACHE = {
         "peer_id": by_peer_id,
         "raw_id": by_raw_id,
         "username": by_username,
@@ -224,102 +232,74 @@ async def load_dialog_entities():
         f"[DIALOGS] Loaded {len(dialogs)} dialogs."
     )
 
-    print(
-        f"[DIALOGS] "
-        f"peer_ids={len(by_peer_id)} "
-        f"raw_ids={len(by_raw_id)} "
-        f"usernames={len(by_username)}"
-    )
-
-    return DIALOG_ENTITIES
+    return DIALOG_CACHE
 
 
 # ============================================================
-# Resolve Telegram source
+# Resolve entity
 # ============================================================
 
-async def resolve_source_entity(source):
-    """
-    Source를 실제 Telethon Entity로 변환한다.
-
-    우선 현재 로그인한 계정의 Dialog 목록에서 찾는다.
-
-    지원:
-        - -100xxxxxxxxxx 형태의 Peer ID
-        - Raw ID
-        - @username
-        - username
-
-    Dialog에서 찾지 못하면 get_entity()를 마지막으로 시도한다.
-    """
+async def resolve_entity(
+    source: str,
+):
 
     source = str(
         source
     ).strip()
 
+    cache = await load_dialog_cache()
+
     print(
         f"[RESOLVE] Trying source={source}"
     )
 
-    entities = await load_dialog_entities()
-
-    # --------------------------------------------------------
-    # 1. Peer ID
-    # --------------------------------------------------------
-
-    entity = entities["peer_id"].get(
+    # Peer ID
+    entity = cache["peer_id"].get(
         source
     )
 
-    if entity is not None:
+    if entity:
 
         print(
-            f"[RESOLVE SUCCESS] "
+            "[RESOLVE SUCCESS] "
             f"Matched Peer ID {source}"
         )
 
         return entity
 
-    # --------------------------------------------------------
-    # 2. Raw ID
-    # --------------------------------------------------------
-
-    entity = entities["raw_id"].get(
+    # Raw ID
+    entity = cache["raw_id"].get(
         source
     )
 
-    if entity is not None:
+    if entity:
 
         print(
-            f"[RESOLVE SUCCESS] "
+            "[RESOLVE SUCCESS] "
             f"Matched Raw ID {source}"
         )
 
         return entity
 
-    # --------------------------------------------------------
-    # 3. Username
-    # --------------------------------------------------------
+    # Username
+    username = source.lstrip(
+        "@"
+    ).lower()
 
-    username = source.lstrip("@").lower()
-
-    entity = entities["username"].get(
+    entity = cache["username"].get(
         username
     )
 
-    if entity is not None:
+    if entity:
 
         print(
-            f"[RESOLVE SUCCESS] "
+            "[RESOLVE SUCCESS] "
             f"Matched username @{username}"
         )
 
         return entity
 
-    # --------------------------------------------------------
-    # 4. get_entity() fallback
-    # --------------------------------------------------------
-
+    # Fallback
     try:
 
         entity = await client.get_entity(
@@ -327,8 +307,8 @@ async def resolve_source_entity(source):
         )
 
         print(
-            f"[RESOLVE SUCCESS] "
-            f"client.get_entity({source})"
+            "[RESOLVE SUCCESS] "
+            f"get_entity({source})"
         )
 
         return entity
@@ -336,49 +316,35 @@ async def resolve_source_entity(source):
     except Exception as exc:
 
         print(
-            f"[RESOLVE FAILED] "
+            "[RESOLVE FAILED] "
             f"source={source} "
             f"type={type(exc).__name__} "
             f"message={exc}"
         )
 
-        raise ValueError(
-            f"Cannot resolve Telegram source: {source}. "
-            f"The logged-in Telegram account may not have "
-            f"access to this group/channel, or the supplied "
-            f"ID/username is incorrect."
-        ) from exc
+        raise
 
 
 # ============================================================
-# Time utilities
+# Date
 # ============================================================
 
 def normalize_datetime(
-    dt: datetime,
+    value: datetime,
 ) -> datetime:
-    """
-    Telegram datetime을 UTC aware datetime으로 변환한다.
-    """
 
-    if dt.tzinfo is None:
+    if value.tzinfo is None:
 
-        return dt.replace(
+        return value.replace(
             tzinfo=UTC
         )
 
-    return dt.astimezone(
+    return value.astimezone(
         UTC
     )
 
 
-def calculate_since() -> datetime:
-    """
-    이번 실행에서 검색할 시작 시각.
-
-    현재 시각에서 70분을 빼되,
-    최초 기준 시각보다 이전으로 내려가지 않는다.
-    """
+def calculate_since():
 
     now = datetime.now(
         UTC
@@ -404,20 +370,6 @@ def calculate_since() -> datetime:
 def is_video_message(
     message,
 ) -> bool:
-    """
-    메시지가 동영상인지 확인한다.
-
-    포함:
-        - Telegram video
-        - video document
-
-    제외:
-        - text
-        - photo
-        - 일반 document
-        - sticker
-        - 기타 media
-    """
 
     if message is None:
         return False
@@ -449,54 +401,34 @@ def is_video_message(
 
 
 # ============================================================
-# Album grouping
+# Grouping
 # ============================================================
-
-def get_group_key(
-    message,
-):
-    """
-    Telegram 앨범 그룹을 판단한다.
-
-    grouped_id가 동일하면 하나의 앨범으로 취급한다.
-    """
-
-    if message.grouped_id is not None:
-
-        return (
-            "album",
-            int(
-                message.grouped_id
-            ),
-        )
-
-    return (
-        "single",
-        int(
-            message.id
-        ),
-    )
-
 
 def group_messages(
     messages,
 ):
-    """
-    메시지를 Telegram 앨범 단위로 그룹화한다.
-
-    사진 + 동영상이 섞여 있어도
-    같은 grouped_id라면 하나의 그룹으로 묶는다.
-
-    이후 업로드 단계에서 동영상만 남긴다.
-    """
 
     groups = {}
 
     for message in messages:
 
-        key = get_group_key(
-            message
-        )
+        if message.grouped_id:
+
+            key = (
+                "album",
+                int(
+                    message.grouped_id
+                ),
+            )
+
+        else:
+
+            key = (
+                "single",
+                int(
+                    message.id
+                ),
+            )
 
         groups.setdefault(
             key,
@@ -505,118 +437,76 @@ def group_messages(
             message
         )
 
-    # 앨범 내부 메시지 순서
-    for key in groups:
+    for group in groups.values():
 
-        groups[key].sort(
-            key=lambda message: message.id
+        group.sort(
+            key=lambda x: x.id
         )
 
-    # 전체 그룹 순서
-    return sorted(
-        groups.values(),
-        key=lambda group: group[0].id,
+    result = list(
+        groups.values()
     )
 
+    result.sort(
+        key=lambda x: x[0].id
+    )
+
+    return result
+
 
 # ============================================================
-# Collect recent messages
+# Collect messages
 # ============================================================
 
-async def collect_recent_messages(
-    source,
-    since: datetime,
+async def collect_messages(
+    entity,
+    since,
 ):
-    """
-    Source 전체에서 since 이후의 메시지를 검색한다.
 
-    Forum Topic 여부와 관계없이 전체 메시지를 확인한다.
-    """
-
-    entity = await resolve_source_entity(
-        source
-    )
-
-    entity_name = getattr(
-        entity,
-        "title",
-        None,
-    )
-
-    entity_id = getattr(
-        entity,
-        "id",
-        None,
-    )
-
-    print(
-        f"[SOURCE ENTITY] "
-        f"name={entity_name!r} "
-        f"id={entity_id}"
-    )
-
-    collected = []
+    messages = []
 
     now = datetime.now(
         UTC
     )
 
-    # 최신 메시지 → 과거 메시지
     async for message in client.iter_messages(
-        entity,
+        entity
     ):
 
         if not message.date:
+
             continue
 
         message_time = normalize_datetime(
             message.date
         )
 
-        # 현재 시각보다 미래인 메시지는 무시
         if message_time > now:
+
             continue
 
-        # 최초 기준 이전 메시지는 무시
         if message_time < CUTOFF_TIME:
-            continue
 
-        # 이번 실행의 조회 시작점 이전이면 종료
-        if message_time < since:
             break
 
-        collected.append(
+        if message_time < since:
+
+            break
+
+        messages.append(
             message
         )
 
-    return collected
+    return messages
 
 
 # ============================================================
-# Forum topic reply object
+# Topic reply
 # ============================================================
 
 def create_topic_reply(
     topic_id: int,
 ):
-    """
-    Telegram Forum Topic에 메시지를 넣기 위한 Reply 객체.
-
-    가장 중요한 부분:
-
-        quote=False
-
-    이렇게 하면 토픽의 첫 메시지를
-    '인용 메시지' 형태로 표시하지 않는다.
-
-    따라서 결과적으로:
-        MOOK
-        동영상
-
-    형태의 초록색 인용/미리보기가 붙는 것을 방지한다.
-
-    topic_id는 Forum Topic의 top/root message ID이다.
-    """
 
     return InputReplyToMessage(
         reply_to_msg_id=int(
@@ -630,46 +520,135 @@ def create_topic_reply(
 
 
 # ============================================================
-# Upload video group
+# Download one video
 # ============================================================
 
-async def send_video_group(
+async def download_video(
+    message,
+    directory,
+):
+
+    source_chat_id = int(
+        message.chat_id
+    )
+
+    message_id = int(
+        message.id
+    )
+
+    print(
+        f"[DOWNLOAD START] "
+        f"source={source_chat_id} "
+        f"message={message_id}"
+    )
+
+    # Telegram이 제공하는 파일 확장자를 최대한 유지한다.
+    extension = ".mp4"
+
+    try:
+
+        document = message.document
+
+        if document:
+
+            for attribute in document.attributes:
+
+                file_name = getattr(
+                    attribute,
+                    "file_name",
+                    None,
+                )
+
+                if file_name:
+
+                    _, ext = os.path.splitext(
+                        file_name
+                    )
+
+                    if ext:
+
+                        extension = ext
+
+                    break
+
+    except Exception:
+
+        pass
+
+    filename = (
+        f"video_"
+        f"{source_chat_id}_"
+        f"{message_id}"
+        f"{extension}"
+    )
+
+    path = os.path.join(
+        directory,
+        filename,
+    )
+
+    try:
+
+        downloaded = await client.download_media(
+            message,
+            file=path,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"[DOWNLOAD FAILED] "
+            f"source={source_chat_id} "
+            f"message={message_id} "
+            f"type={type(exc).__name__} "
+            f"message={exc}"
+        )
+
+        raise
+
+    if not downloaded:
+
+        raise RuntimeError(
+            "Telegram returned no downloaded file."
+        )
+
+    if not os.path.exists(
+        downloaded
+    ):
+
+        raise RuntimeError(
+            f"Downloaded file does not exist: "
+            f"{downloaded}"
+        )
+
+    size = os.path.getsize(
+        downloaded
+    )
+
+    print(
+        f"[DOWNLOAD SUCCESS] "
+        f"message={message_id} "
+        f"size={size:,} bytes "
+        f"path={downloaded}"
+    )
+
+    return downloaded
+
+
+# ============================================================
+# Upload videos
+# ============================================================
+
+async def upload_video_group(
     messages,
-    target_chat,
     topic_id,
 ):
-    """
-    하나의 개별 메시지 또는 앨범에서
-    동영상만 추출하여 대상 Forum Topic으로 업로드한다.
-
-    규칙:
-
-        text       → 제외
-        photo      → 제외
-        video      → 업로드
-
-    앨범:
-
-        photo
-        video
-        photo
-        video
-
-    라면:
-
-        video
-        video
-
-    만 업로드한다.
-
-    원본 caption/설명은 전달하지 않는다.
-    """
 
     # --------------------------------------------------------
-    # 1. 동영상만 추출
+    # 동영상만 추출
     # --------------------------------------------------------
 
-    video_messages = [
+    videos = [
         message
         for message in messages
         if is_video_message(message)
@@ -678,27 +657,26 @@ async def send_video_group(
     print(
         f"[GROUP] "
         f"total_messages={len(messages)} "
-        f"video_messages={len(video_messages)}"
+        f"video_messages={len(videos)}"
     )
 
-    if not video_messages:
+    if not videos:
 
         print(
-            "[SKIP] "
-            "No video in this message/group."
+            "[SKIP] No video."
         )
 
         return
 
     # --------------------------------------------------------
-    # 2. 이미 처리된 동영상 제거
+    # 중복 검사
     # --------------------------------------------------------
 
-    new_video_messages = []
+    new_videos = []
 
-    for message in video_messages:
+    for message in videos:
 
-        source_id = int(
+        source_chat_id = int(
             message.chat_id
         )
 
@@ -707,176 +685,194 @@ async def send_video_group(
         )
 
         if is_processed(
-            source_id,
+            source_chat_id,
             message_id,
         ):
 
             print(
                 f"[DUPLICATE] "
-                f"source={source_id} "
+                f"source={source_chat_id} "
                 f"message={message_id}"
             )
 
             continue
 
-        new_video_messages.append(
+        print(
+            f"[VIDEO FOUND] "
+            f"source={source_chat_id} "
+            f"message={message_id}"
+        )
+
+        new_videos.append(
             message
         )
 
-    if not new_video_messages:
+    if not new_videos:
 
         print(
             "[SKIP] "
-            "All videos were already processed."
+            "All videos already processed."
         )
 
         return
 
     # --------------------------------------------------------
-    # 3. 업로드할 Telegram media
+    # Temporary directory
     # --------------------------------------------------------
 
-    media = [
-        message.media
-        for message in new_video_messages
-    ]
+    with tempfile.TemporaryDirectory(
+        prefix="tg_video_"
+    ) as temp_dir:
 
-    message_ids = [
-        int(
-            message.id
-        )
-        for message in new_video_messages
-    ]
+        downloaded_files = []
 
-    print(
-        f"[UPLOAD] "
-        f"target={target_chat} "
-        f"topic={topic_id} "
-        f"message_ids={message_ids}"
-    )
+        try:
 
-    # --------------------------------------------------------
-    # 4. Forum Topic reply object
-    #
-    # quote=False
-    #
-    # 이것이 기존에 보이던
-    #
-    # MOOK
-    # 동영상
-    #
-    # 형태의 인용 표시를 제거한다.
-    # --------------------------------------------------------
+            # =================================================
+            # Download
+            # =================================================
 
-    topic_reply = create_topic_reply(
-        topic_id
-    )
+            for message in new_videos:
 
-    try:
+                path = await download_video(
+                    message,
+                    temp_dir,
+                )
 
-        # ----------------------------------------------------
-        # 단일 동영상
-        # ----------------------------------------------------
+                downloaded_files.append(
+                    path
+                )
 
-        if len(media) == 1:
+            if not downloaded_files:
 
-            await client.send_file(
-                entity=target_chat,
-                file=media[0],
+                raise RuntimeError(
+                    "No video files were downloaded."
+                )
 
-                # 원본 caption을 전달하지 않는다.
-                caption=None,
+            # =================================================
+            # Upload
+            # =================================================
 
-                # Forum Topic 지정
-                reply_to=topic_reply,
+            topic_reply = create_topic_reply(
+                topic_id
             )
 
-        # ----------------------------------------------------
-        # 여러 동영상
-        #
-        # 하나의 Telegram album으로 전송
-        # ----------------------------------------------------
-
-        else:
-
-            await client.send_file(
-                entity=target_chat,
-                file=media,
-
-                # 원본 caption을 전달하지 않는다.
-                caption=None,
-
-                # Forum Topic 지정
-                reply_to=topic_reply,
+            print(
+                f"[UPLOAD START] "
+                f"videos={len(downloaded_files)} "
+                f"topic={topic_id}"
             )
 
-    except Exception as exc:
-
-        print(
-            f"[UPLOAD ERROR] "
-            f"type={type(exc).__name__} "
-            f"message={exc}"
-        )
-
-        # 업로드 실패 시 DB에 기록하지 않는다.
-        # 다음 실행에서 재시도할 수 있다.
-
-        raise
-
-    # --------------------------------------------------------
-    # 5. 업로드 성공
-    # --------------------------------------------------------
-
-    print(
-        f"[UPLOAD SUCCESS] "
-        f"topic={topic_id} "
-        f"videos={len(new_video_messages)}"
-    )
-
-    # --------------------------------------------------------
-    # 6. DB 기록
-    #
-    # 반드시 업로드 성공 후 기록한다.
-    # --------------------------------------------------------
-
-    processed_at = datetime.now(
-        UTC
-    ).isoformat()
-
-    mark_processed(
-        [
-            (
-                int(
-                    message.chat_id
-                ),
-                int(
-                    message.id
-                ),
+            print(
+                "[UPLOAD] "
+                "caption=None"
             )
-            for message in new_video_messages
-        ],
-        processed_at,
-    )
 
-    print(
-        f"[DATABASE] "
-        f"marked={len(new_video_messages)}"
-    )
+            print(
+                "[UPLOAD] "
+                "quote=False"
+            )
+
+            # ------------------------------------------------
+            # Single video
+            # ------------------------------------------------
+
+            if len(downloaded_files) == 1:
+
+                await client.send_file(
+                    entity=TARGET_CHAT,
+                    file=downloaded_files[0],
+                    caption=None,
+                    force_document=False,
+                    reply_to=topic_reply,
+                )
+
+            # ------------------------------------------------
+            # Multiple videos = Telegram album
+            # ------------------------------------------------
+
+            else:
+
+                await client.send_file(
+                    entity=TARGET_CHAT,
+                    file=downloaded_files,
+                    caption=None,
+                    force_document=False,
+                    reply_to=topic_reply,
+                )
+
+            print(
+                f"[UPLOAD SUCCESS] "
+                f"videos={len(downloaded_files)} "
+                f"topic={topic_id}"
+            )
+
+            # =================================================
+            # DB
+            # =================================================
+
+            processed_at = datetime.now(
+                UTC
+            ).isoformat()
+
+            mark_processed(
+                [
+                    (
+                        int(
+                            message.chat_id
+                        ),
+                        int(
+                            message.id
+                        ),
+                    )
+                    for message in new_videos
+                ],
+                processed_at,
+            )
+
+            print(
+                f"[DATABASE] "
+                f"marked={len(new_videos)}"
+            )
+
+            print(
+                f"[DATABASE] "
+                f"total_processed={count_processed()}"
+            )
+
+        except Exception as exc:
+
+            print(
+                "[VIDEO GROUP FAILED]"
+            )
+
+            print(
+                f"type={type(exc).__name__}"
+            )
+
+            print(
+                f"message={exc}"
+            )
+
+            # ------------------------------------------------
+            # 중요:
+            #
+            # 업로드 실패 시 DB에 기록하지 않는다.
+            # 다음 실행에서 다시 시도할 수 있다.
+            # ------------------------------------------------
+
+            raise
 
 
 # ============================================================
-# Process one source
+# Process source
 # ============================================================
 
 async def process_source(
     source,
-    target_chat,
     topic_id,
     since,
 ):
-    """
-    하나의 Source를 처리한다.
-    """
 
     print()
     print(
@@ -884,45 +880,47 @@ async def process_source(
     )
 
     print(
-        f"[PROCESS SOURCE] "
-        f"{source}"
+        f"[PROCESS SOURCE] {source}"
     )
 
     print(
-        f"[DESTINATION TOPIC] "
-        f"{topic_id}"
+        f"[DESTINATION TOPIC] {topic_id}"
     )
 
     print(
-        f"[SINCE] "
-        f"{since.isoformat()}"
+        f"[SINCE] {since.isoformat()}"
     )
 
     print(
         "=" * 70
     )
 
-    # --------------------------------------------------------
-    # 메시지 검색
-    # --------------------------------------------------------
+    entity = await resolve_entity(
+        source
+    )
 
-    try:
+    title = getattr(
+        entity,
+        "title",
+        None,
+    )
 
-        messages = await collect_recent_messages(
-            source,
-            since,
-        )
+    raw_id = getattr(
+        entity,
+        "id",
+        None,
+    )
 
-    except Exception as exc:
+    print(
+        f"[SOURCE ENTITY] "
+        f"name={title!r} "
+        f"id={raw_id}"
+    )
 
-        print(
-            f"[SOURCE ERROR] "
-            f"source={source} "
-            f"type={type(exc).__name__} "
-            f"message={exc}"
-        )
-
-        raise
+    messages = await collect_messages(
+        entity,
+        since,
+    )
 
     print(
         f"[MESSAGES FOUND] "
@@ -932,15 +930,10 @@ async def process_source(
     if not messages:
 
         print(
-            "[SKIP SOURCE] "
-            "No messages in time range."
+            "[SOURCE] No messages."
         )
 
         return
-
-    # --------------------------------------------------------
-    # 앨범 그룹화
-    # --------------------------------------------------------
 
     groups = group_messages(
         messages
@@ -952,7 +945,7 @@ async def process_source(
     )
 
     # --------------------------------------------------------
-    # 그룹별 처리
+    # 각각의 메시지/앨범 처리
     # --------------------------------------------------------
 
     for index, group in enumerate(
@@ -962,27 +955,42 @@ async def process_source(
 
         print()
         print(
+            "-" * 60
+        )
+
+        print(
             f"[GROUP {index}/{len(groups)}]"
+        )
+
+        print(
+            f"[GROUP MESSAGE IDS] "
+            f"{[message.id for message in group]}"
+        )
+
+        print(
+            f"[GROUP GROUPED IDS] "
+            f"{[message.grouped_id for message in group]}"
         )
 
         try:
 
-            await send_video_group(
+            await upload_video_group(
                 group,
-                target_chat,
                 topic_id,
             )
 
         except Exception as exc:
 
             print(
-                f"[GROUP ERROR] "
+                f"[GROUP FAILED] "
+                f"source={source} "
+                f"group={index} "
                 f"type={type(exc).__name__} "
                 f"message={exc}"
             )
 
             # 한 그룹이 실패해도
-            # 나머지 그룹은 계속 처리한다.
+            # 다른 그룹은 계속 처리한다.
             continue
 
 
@@ -993,7 +1001,13 @@ async def process_source(
 async def main():
 
     # --------------------------------------------------------
-    # 실행 시간
+    # DB 초기화
+    # --------------------------------------------------------
+
+    init_db()
+
+    # --------------------------------------------------------
+    # Time
     # --------------------------------------------------------
 
     now = datetime.now(
@@ -1016,8 +1030,7 @@ async def main():
     )
 
     print(
-        f"[NOW UTC] "
-        f"{now.isoformat()}"
+        f"[NOW UTC] {now.isoformat()}"
     )
 
     print(
@@ -1056,11 +1069,16 @@ async def main():
     )
 
     print(
+        f"[DATABASE] "
+        f"processed={count_processed()}"
+    )
+
+    print(
         "=" * 70
     )
 
     # --------------------------------------------------------
-    # Telegram 로그인
+    # Telegram
     # --------------------------------------------------------
 
     print(
@@ -1074,7 +1092,7 @@ async def main():
     if me is None:
 
         raise RuntimeError(
-            "Telegram authentication failed."
+            "Telegram login failed."
         )
 
     print(
@@ -1084,10 +1102,10 @@ async def main():
     )
 
     # --------------------------------------------------------
-    # Source 처리
+    # Sources
     # --------------------------------------------------------
 
-    total_sources = len(
+    total = len(
         SOURCE_MAPPING
     )
 
@@ -1101,14 +1119,13 @@ async def main():
 
         print()
         print(
-            f"[SOURCE {index}/{total_sources}]"
+            f"[SOURCE {index}/{total}]"
         )
 
         try:
 
             await process_source(
                 source,
-                TARGET_CHAT,
                 topic_id,
                 since,
             )
@@ -1122,12 +1139,10 @@ async def main():
                 f"message={exc}"
             )
 
-            # 하나의 Source가 실패해도
-            # 나머지 Source는 계속 처리한다.
             continue
 
     # --------------------------------------------------------
-    # 종료
+    # Finished
     # --------------------------------------------------------
 
     print()
@@ -1140,12 +1155,17 @@ async def main():
     )
 
     print(
+        f"[DATABASE] "
+        f"processed={count_processed()}"
+    )
+
+    print(
         "=" * 70
     )
 
 
 # ============================================================
-# Entry point
+# Entry
 # ============================================================
 
 if __name__ == "__main__":
@@ -1168,15 +1188,15 @@ if __name__ == "__main__":
         )
 
         print(
-            "=" * 70
-        )
-
-        print(
             f"type={type(exc).__name__}"
         )
 
         print(
             f"message={exc}"
+        )
+
+        print(
+            "=" * 70
         )
 
         raise
