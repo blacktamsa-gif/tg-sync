@@ -1,165 +1,98 @@
-import os
 import sqlite3
-from typing import Iterable, Tuple
+from pathlib import Path
+from typing import Optional
 
 
-# ============================================================
-# Database location
-# ============================================================
+DB_PATH = Path(__file__).resolve().parent / "state.db"
 
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-DB_PATH = os.path.join(
-    BASE_DIR,
-    "state.db",
-)
-
-
-# ============================================================
-# Connection
-# ============================================================
 
 def get_connection():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-    )
-
+    conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
-        PRAGMA journal_mode=WAL
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            source_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (source_id, message_id)
+        )
         """
     )
-
-    conn.execute(
-        """
-        PRAGMA busy_timeout=30000
-        """
-    )
-
+    conn.commit()
     return conn
 
 
-# ============================================================
-# Initialize
-# ============================================================
+def is_processed(source_id: int, message_id: int) -> bool:
+    conn = get_connection()
 
-def init_db():
-    """
-    처리 완료된 Telegram 메시지 ID를 저장한다.
-    """
-
-    os.makedirs(
-        BASE_DIR,
-        exist_ok=True,
-    )
-
-    with get_connection() as conn:
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS processed_messages (
-                source_chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                processed_at TEXT NOT NULL,
-                PRIMARY KEY (
-                    source_chat_id,
-                    message_id
-                )
-            )
-            """
-        )
-
-        conn.commit()
-
-
-# ============================================================
-# Check processed
-# ============================================================
-
-def is_processed(
-    source_chat_id: int,
-    message_id: int,
-) -> bool:
-
-    init_db()
-
-    with get_connection() as conn:
-
+    try:
         row = conn.execute(
             """
             SELECT 1
             FROM processed_messages
-            WHERE source_chat_id = ?
-              AND message_id = ?
+            WHERE source_id = ? AND message_id = ?
             LIMIT 1
             """,
-            (
-                int(source_chat_id),
-                int(message_id),
-            ),
+            (source_id, message_id),
         ).fetchone()
 
-    return row is not None
+        return row is not None
+
+    finally:
+        conn.close()
 
 
-# ============================================================
-# Mark processed
-# ============================================================
+def mark_processed(source_id: int, message_id: int):
+    conn = get_connection()
 
-def mark_processed(
-    messages: Iterable[Tuple[int, int]],
-    processed_at: str,
-):
-    """
-    업로드가 성공한 동영상만 기록한다.
-    """
-
-    init_db()
-
-    rows = [
-        (
-            int(source_chat_id),
-            int(message_id),
-            processed_at,
-        )
-        for source_chat_id, message_id
-        in messages
-    ]
-
-    if not rows:
-        return
-
-    with get_connection() as conn:
-
-        conn.executemany(
+    try:
+        conn.execute(
             """
             INSERT OR IGNORE INTO processed_messages
             (
-                source_chat_id,
-                message_id,
-                processed_at
+                source_id,
+                message_id
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?)
             """,
-            rows,
+            (source_id, message_id),
         )
 
         conn.commit()
 
+    finally:
+        conn.close()
 
-# ============================================================
-# Statistics
-# ============================================================
+
+def mark_processed_many(source_id: int, message_ids):
+    conn = get_connection()
+
+    try:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO processed_messages
+            (
+                source_id,
+                message_id
+            )
+            VALUES (?, ?)
+            """,
+            [
+                (source_id, int(message_id))
+                for message_id in message_ids
+            ],
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
 
 def count_processed() -> int:
+    conn = get_connection()
 
-    init_db()
-
-    with get_connection() as conn:
-
+    try:
         row = conn.execute(
             """
             SELECT COUNT(*)
@@ -167,6 +100,29 @@ def count_processed() -> int:
             """
         ).fetchone()
 
-    return int(
-        row[0]
-    )
+        return int(row[0] or 0)
+
+    finally:
+        conn.close()
+
+
+def get_max_processed_message_id(source_id: int) -> Optional[int]:
+    conn = get_connection()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT MAX(message_id)
+            FROM processed_messages
+            WHERE source_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+
+        if row is None or row[0] is None:
+            return None
+
+        return int(row[0])
+
+    finally:
+        conn.close()
