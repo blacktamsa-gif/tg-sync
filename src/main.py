@@ -10,6 +10,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from database import (
+    init_db,
     count_processed,
     is_processed,
     mark_processed_many,
@@ -20,7 +21,7 @@ from database import (
 # VERSION
 # ============================================================
 
-PROCESSOR_VERSION = "2026-08-26-LOOKBACK-130-CLEAN-02"
+PROCESSOR_VERSION = "2026-08-26-LOOKBACK-130-CLEAN-03-DB-MIGRATION"
 
 
 # ============================================================
@@ -997,6 +998,10 @@ async def process_source(
 
 async def main():
     require_environment()
+
+    # Initialize/migrate SQLite BEFORE any database query.
+    # This is required when restoring an older state.db from GitHub Actions cache.
+    init_db()
 
     current_utc = now_utc()
 
