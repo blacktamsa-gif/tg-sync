@@ -2,10 +2,14 @@ name: Telegram Scheduled Video Processor
 
 on:
   schedule:
-    - cron: "10 * * * *"
+    # 매시 17분
+    #
+    # GitHub 공식 문서상 매시 정각은
+    # Actions 부하가 높은 시간이라 지연/누락 가능성이
+    # 있으므로 정각을 피한다.
+    - cron: "17 * * * *"
 
   workflow_dispatch:
-
 
 concurrency:
   group: telegram-video-processor
@@ -39,29 +43,55 @@ jobs:
 
 
       # ======================================================
-      # Prepare directories
+      # Prepare state directory
       # ======================================================
 
-      - name: Prepare directories
+      - name: Prepare state directory
         run: |
           mkdir -p src
+          touch src/state.db
+
+          echo "State path:"
+          ls -lah src/state.db
 
 
       # ======================================================
-      # Restore processing database
+      # Restore SQLite state
+      #
+      # IMPORTANT:
+      # DB is stored at src/state.db
       # ======================================================
 
       - name: Restore processing database
         uses: actions/cache/restore@v5
         with:
           path: src/state.db
-          key: telegram-state-${{ github.ref_name }}-${{ github.run_id }}
+          key: telegram-state-main-${{ github.run_id }}
           restore-keys: |
-            telegram-state-${{ github.ref_name }}-
+            telegram-state-main-
 
 
       # ======================================================
-      # Install dependencies
+      # Verify restored DB
+      # ======================================================
+
+      - name: Verify processing database
+        run: |
+          echo "=========================================="
+          echo "Database verification"
+          echo "=========================================="
+
+          if [ -f src/state.db ]; then
+            echo "state.db exists."
+            ls -lah src/state.db
+          else
+            echo "state.db does not exist."
+            exit 1
+          fi
+
+
+      # ======================================================
+      # Install
       # ======================================================
 
       - name: Install dependencies
@@ -105,43 +135,43 @@ jobs:
 
           echo "=========================================="
 
-          python -m py_compile src/main.py
-          python -m py_compile src/database.py
-
           cd src
 
           python main.py
 
 
       # ======================================================
-      # Verify database
+      # Verify database after processing
       # ======================================================
 
-      - name: Verify processing database
+      - name: Verify processing database after run
         if: always()
         run: |
 
           echo "=========================================="
-          echo "Database verification"
+          echo "Post-run database verification"
           echo "=========================================="
 
           if [ -f src/state.db ]; then
 
             echo "state.db exists."
 
-            ls -lh src/state.db
+            ls -lah src/state.db
 
           else
 
-            echo "state.db does not exist."
+            echo "ERROR: src/state.db does not exist."
 
-            echo "This is acceptable if no video was successfully uploaded."
+            exit 1
 
           fi
 
 
       # ======================================================
       # Save SQLite state
+      #
+      # Unique key is important because GitHub cache entries
+      # are immutable.
       # ======================================================
 
       - name: Save processing database
@@ -149,4 +179,4 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: src/state.db
-          key: telegram-state-${{ github.ref_name }}-${{ github.run_id }}
+          key: telegram-state-main-${{ github.run_id }}
