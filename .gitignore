@@ -1,13 +1,31 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-state.db
-
-.env
+# Virtual environment
 .venv/
 venv/
+env/
 
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Telegram local session
 *.session
 *.session-journal
 
+# Temporary files
+tmp/
+temp/
+downloads/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
+Thumbs.db
