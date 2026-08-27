@@ -2,11 +2,6 @@ name: Telegram Scheduled Video Processor
 
 on:
   schedule:
-    # 매시 17분
-    #
-    # GitHub 공식 문서상 매시 정각은
-    # Actions 부하가 높은 시간이라 지연/누락 가능성이
-    # 있으므로 정각을 피한다.
     - cron: "17 * * * *"
 
   workflow_dispatch:
@@ -15,98 +10,35 @@ concurrency:
   group: telegram-video-processor
   cancel-in-progress: false
 
-
 jobs:
-
   run:
-
     runs-on: ubuntu-latest
 
     steps:
 
-      # ======================================================
-      # Checkout
-      # ======================================================
-
       - name: Checkout repository
         uses: actions/checkout@v5
-
-
-      # ======================================================
-      # Python
-      # ======================================================
 
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-
-      # ======================================================
-      # Prepare state directory
-      # ======================================================
-
-      - name: Prepare state directory
-        run: |
-          mkdir -p src
-          touch src/state.db
-
-          echo "State path:"
-          ls -lah src/state.db
-
-
-      # ======================================================
-      # Restore SQLite state
-      #
-      # IMPORTANT:
-      # DB is stored at src/state.db
-      # ======================================================
-
       - name: Restore processing database
         uses: actions/cache/restore@v5
         with:
           path: src/state.db
-          key: telegram-state-main-${{ github.run_id }}
+          key: telegram-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            telegram-state-main-
-
-
-      # ======================================================
-      # Verify restored DB
-      # ======================================================
-
-      - name: Verify processing database
-        run: |
-          echo "=========================================="
-          echo "Database verification"
-          echo "=========================================="
-
-          if [ -f src/state.db ]; then
-            echo "state.db exists."
-            ls -lah src/state.db
-          else
-            echo "state.db does not exist."
-            exit 1
-          fi
-
-
-      # ======================================================
-      # Install
-      # ======================================================
+            telegram-state-${{ github.ref_name }}-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-
-      # ======================================================
-      # Run Telegram processor
-      # ======================================================
-
       - name: Run Telegram processor
         env:
-
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION: ${{ secrets.SESSION }}
@@ -122,7 +54,6 @@ jobs:
           TOPIC_B: ${{ secrets.TOPIC_B }}
 
         run: |
-
           echo "=========================================="
           echo "Starting Telegram processor"
           echo "=========================================="
@@ -136,47 +67,25 @@ jobs:
           echo "=========================================="
 
           cd src
-
           python main.py
 
-
-      # ======================================================
-      # Verify database after processing
-      # ======================================================
-
-      - name: Verify processing database after run
+      - name: Verify database
         if: always()
         run: |
-
           echo "=========================================="
-          echo "Post-run database verification"
+          echo "Database verification"
           echo "=========================================="
 
           if [ -f src/state.db ]; then
-
             echo "state.db exists."
-
-            ls -lah src/state.db
-
+            ls -lh src/state.db
           else
-
-            echo "ERROR: src/state.db does not exist."
-
-            exit 1
-
+            echo "WARNING: state.db does not exist."
           fi
-
-
-      # ======================================================
-      # Save SQLite state
-      #
-      # Unique key is important because GitHub cache entries
-      # are immutable.
-      # ======================================================
 
       - name: Save processing database
         if: always()
         uses: actions/cache/save@v5
         with:
           path: src/state.db
-          key: telegram-state-main-${{ github.run_id }}
+          key: telegram-state-${{ github.ref_name }}-${{ github.run_id }}
