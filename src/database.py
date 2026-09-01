@@ -18,8 +18,22 @@ def get_connection():
     """
     SQLite connection 생성.
 
-    GitHub Actions에서 cache 복원 후 사용할 수 있도록
-    WAL + busy_timeout 적용.
+    중요:
+    GitHub Actions runner는 매 실행마다 새로 생성되고,
+    다음 실행으로 넘어가는 상태는 GitHub Actions Cache가
+    저장한 'src/state.db' 파일 단 하나뿐이다.
+
+    이전에는 WAL 모드를 사용했는데, WAL 모드에서는 커밋된
+    내용이 즉시 state.db 본문에 반영되지 않고 별도의
+    'state.db-wal' 파일에 먼저 쌓였다가, 특정 조건(용량 등)에서만
+    본문으로 체크포인트된다. 이 프로젝트처럼 매 실행 후 러너가
+    통째로 사라지고, 캐시 경로에도 state.db-wal이 포함되어 있지
+    않은 환경에서는 방금 커밋한 처리 기록이 다음 실행에 전혀
+    전달되지 않아 매번 같은 영상이 새로 처리되는 것처럼 보이는
+    중복 업로드가 발생했다.
+
+    따라서 여기서는 커밋 즉시 state.db 본문에 바로 기록되는
+    기본 저널 모드(DELETE)를 명시적으로 사용한다.
     """
 
     conn = sqlite3.connect(
@@ -27,7 +41,8 @@ def get_connection():
         timeout=30,
     )
 
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA busy_timeout=30000")
 
     return conn
