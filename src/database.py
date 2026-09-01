@@ -180,11 +180,139 @@ def init_db():
             """
         )
 
+        # ----------------------------------------------------
+        # 파일 해시 기반 중복 방지 테이블
+        #
+        # source_id/message_id 기준 중복 체크와는 별개로,
+        # 실제 다운로드한 영상 파일의 SHA-256 해시를 기준으로
+        # "완전히 같은 영상 파일"이 이미 업로드된 적 있는지
+        # 확인하기 위한 안전망(safety net) 용도.
+        #
+        # 서로 다른 소스(A/B/C/D)에서 같은 영상이 재업로드되거나,
+        # state.db의 message 단위 추적이 어떤 이유로 실패하더라도
+        # 이 테이블은 별도로 마지막 방어선 역할을 한다.
+        # ----------------------------------------------------
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_hashes (
+
+                file_hash TEXT PRIMARY KEY,
+
+                source_id INTEGER,
+
+                message_id INTEGER,
+
+                processed_at TEXT
+
+            )
+            """
+        )
+
         conn.commit()
 
         print(
             f"[DATABASE] initialized: {DB_PATH}"
         )
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# FILE HASH CHECK (safety-net dedup)
+# ============================================================
+
+def is_hash_processed(
+    file_hash: str,
+) -> bool:
+    """
+    이 파일 해시(SHA-256)를 가진 영상이
+    이미 업로드된 적 있는지 확인.
+    """
+
+    conn = get_connection()
+
+    try:
+
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM processed_hashes
+            WHERE file_hash = ?
+            LIMIT 1
+            """,
+            (
+                file_hash,
+            ),
+        ).fetchone()
+
+        return row is not None
+
+    finally:
+        conn.close()
+
+
+def mark_hash_processed(
+    file_hash: str,
+    source_id: int,
+    message_id: int,
+):
+    """
+    업로드 성공한 파일의 해시를 기록.
+    """
+
+    conn = get_connection()
+
+    try:
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO processed_hashes
+            (
+                file_hash,
+                source_id,
+                message_id,
+                processed_at
+            )
+            VALUES
+            (
+                ?,
+                ?,
+                ?,
+                datetime('now')
+            )
+            """,
+            (
+                file_hash,
+                int(source_id),
+                int(message_id),
+            ),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+def count_hashes() -> int:
+    """
+    기록된 전체 파일 해시 수.
+    """
+
+    conn = get_connection()
+
+    try:
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM processed_hashes
+            """
+        ).fetchone()
+
+        return int(row[0])
 
     finally:
         conn.close()
