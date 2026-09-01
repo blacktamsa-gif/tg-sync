@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import hashlib
 import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,8 @@ from database import (
     count_processed,
     is_processed,
     mark_processed_many,
+    is_hash_processed,
+    mark_hash_processed,
 )
 
 
@@ -519,6 +522,36 @@ async def download_video(
 
 
 # ============================================================
+# FILE HASH (safety-net dedup)
+# ============================================================
+
+def compute_file_hash(path: Path) -> str:
+    """
+    다운로드한 영상 파일의 SHA-256 해시 계산.
+
+    같은 영상이 서로 다른 소스(채팅방)에서 올라오거나,
+    message_id 기준 중복 체크가 어떤 이유로 실패하더라도
+    "완전히 같은 파일 내용"을 기준으로 중복을 잡아내기 위한
+    안전망(safety net)이다.
+
+    대용량 영상 파일을 한 번에 메모리에 올리지 않도록
+    청크 단위로 읽는다.
+    """
+
+    hasher = hashlib.sha256()
+
+    with open(path, "rb") as f:
+
+        for chunk in iter(
+            lambda: f.read(1024 * 1024),
+            b"",
+        ):
+            hasher.update(chunk)
+
+    return hasher.hexdigest()
+
+
+# ============================================================
 # UPLOAD
 # ============================================================
 
@@ -884,6 +917,8 @@ async def process_source(
 
             downloaded_files = []
 
+            duplicate_message_ids = []
+
             download_failed = False
 
             for message in new_video_messages:
@@ -906,8 +941,50 @@ async def process_source(
 
                     break
 
+                # ------------------------------------------------
+                # Hash-based duplicate check (safety net).
+                #
+                # Even if this exact source/message was never
+                # seen before, the downloaded video content itself
+                # might already have been uploaded (e.g. reposted
+                # in a different source chat, or a state.db
+                # regression like the one that caused this feature
+                # to be added).
+                # ------------------------------------------------
+
+                file_hash = compute_file_hash(file_path)
+
+                print(
+                    f"[FILE HASH] "
+                    f"message={message.id} "
+                    f"hash={file_hash[:12]}...",
+                    flush=True,
+                )
+
+                if is_hash_processed(file_hash):
+
+                    print(
+                        f"[DUPLICATE SKIP] "
+                        f"message={message.id} "
+                        f"reason=identical file already uploaded",
+                        flush=True,
+                    )
+
+                    duplicate_message_ids.append(
+                        message.id
+                    )
+
+                    # Free disk space immediately; this file
+                    # will not be uploaded.
+                    try:
+                        file_path.unlink()
+                    except OSError:
+                        pass
+
+                    continue
+
                 downloaded_files.append(
-                    file_path
+                    (message, file_path, file_hash)
                 )
 
             # ------------------------------------------------
@@ -930,29 +1007,52 @@ async def process_source(
                 continue
 
             # ------------------------------------------------
-            # Upload
+            # Upload only the genuinely new (non-duplicate) files.
             # ------------------------------------------------
 
-            upload_success = await upload_videos(
-                client,
-                target_entity,
-                topic_id,
-                downloaded_files,
-            )
+            files_to_upload = [
+                file_path
+                for _message, file_path, _file_hash in downloaded_files
+            ]
 
-            if not upload_success:
+            upload_success = True
+
+            if files_to_upload:
+
+                upload_success = await upload_videos(
+                    client,
+                    target_entity,
+                    topic_id,
+                    files_to_upload,
+                )
+
+                if not upload_success:
+
+                    print(
+                        "[GROUP FAILED] "
+                        "Upload failed. "
+                        "Database will NOT be updated.",
+                        flush=True,
+                    )
+
+                    continue
+
+            else:
 
                 print(
-                    "[GROUP FAILED] "
-                    "Upload failed. "
-                    "Database will NOT be updated.",
+                    "[UPLOAD SKIPPED] "
+                    "All videos in this group were duplicates "
+                    "of already-uploaded files.",
                     flush=True,
                 )
 
-                continue
-
             # ------------------------------------------------
-            # Mark processed only AFTER successful upload.
+            # Mark processed only AFTER successful upload
+            # (or after confirming every video was a duplicate).
+            #
+            # This covers ALL new_video_messages in the group:
+            # the ones actually uploaded AND the ones skipped
+            # as duplicates, since both are now fully handled.
             # ------------------------------------------------
 
             message_ids = [
@@ -965,13 +1065,23 @@ async def process_source(
                 message_ids,
             )
 
+            for message, _file_path, file_hash in downloaded_files:
+
+                mark_hash_processed(
+                    file_hash,
+                    source_entity_id,
+                    message.id,
+                )
+
             uploaded_count += len(
-                new_video_messages
+                downloaded_files
             )
 
             print(
                 f"[DATABASE] "
-                f"marked={len(message_ids)}",
+                f"marked={len(message_ids)} "
+                f"(uploaded={len(downloaded_files)} "
+                f"duplicates={len(duplicate_message_ids)})",
                 flush=True,
             )
 
